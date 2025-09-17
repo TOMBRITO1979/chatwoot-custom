@@ -1,0 +1,121 @@
+# ======================================
+# MAKEFILE - CHATWOOT DOCKER DEPLOY
+# ======================================
+
+.PHONY: help build deploy quick-deploy logs shell db-migrate db-seed backup restore clean
+
+# Carregar variáveis do .env
+include .env.production
+export
+
+# Definir imagem
+IMAGE_NAME := $(DOCKER_USERNAME)/chatwoot:latest
+
+help: ## Mostrar ajuda
+	@echo "🚀 Chatwoot Docker Deploy"
+	@echo ""
+	@echo "Comandos disponíveis:"
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+setup: ## Configuração inicial
+	@echo "📋 Configuração inicial..."
+	@cp .env.production.template .env.production
+	@echo "✅ Configure o arquivo .env.production e execute 'make build'"
+
+build: ## Build completo e deploy
+	@chmod +x build-and-deploy.sh
+	@./build-and-deploy.sh
+
+quick-deploy: ## Deploy rápido (sem build)
+	@chmod +x quick-deploy.sh
+	@./quick-deploy.sh
+
+logs: ## Ver logs de todos os serviços
+	@docker-compose -f docker-compose.production.yml logs -f
+
+logs-app: ## Ver logs apenas do app
+	@docker-compose -f docker-compose.production.yml logs -f chatwoot
+
+logs-sidekiq: ## Ver logs do Sidekiq
+	@docker-compose -f docker-compose.production.yml logs -f sidekiq
+
+status: ## Status dos serviços
+	@docker-compose -f docker-compose.production.yml ps
+
+shell: ## Shell no container principal
+	@docker exec -it chatwoot-app /bin/sh
+
+shell-rails: ## Console Rails
+	@docker exec -it chatwoot-app bundle exec rails console
+
+db-migrate: ## Executar migrations
+	@echo "🗄️ Executando migrations..."
+	@docker exec chatwoot-app bundle exec rails db:create db:migrate
+
+db-seed: ## Popular banco com dados iniciais
+	@echo "🌱 Populando banco..."
+	@docker exec chatwoot-app bundle exec rails db:seed
+
+db-reset: ## Reset completo do banco (CUIDADO!)
+	@echo "⚠️  CUIDADO: Isso apagará todos os dados!"
+	@read -p "Digite 'CONFIRMAR' para continuar: " confirm && [ "$$confirm" = "CONFIRMAR" ]
+	@docker exec chatwoot-app bundle exec rails db:drop db:create db:migrate db:seed
+
+backup: ## Backup do banco de dados
+	@echo "💾 Fazendo backup..."
+	@mkdir -p backups
+	@docker exec chatwoot-postgres pg_dump -U $(POSTGRES_USER) $(POSTGRES_DB) > backups/backup-$(shell date +%Y%m%d-%H%M%S).sql
+	@echo "✅ Backup salvo em backups/"
+
+restore: ## Restaurar backup (especificar BACKUP_FILE=arquivo.sql)
+	@if [ -z "$(BACKUP_FILE)" ]; then echo "❌ Especifique BACKUP_FILE=arquivo.sql"; exit 1; fi
+	@echo "📥 Restaurando backup $(BACKUP_FILE)..."
+	@docker exec -i chatwoot-postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) < $(BACKUP_FILE)
+
+stop: ## Parar todos os serviços
+	@docker-compose -f docker-compose.production.yml down
+
+restart: ## Reiniciar todos os serviços
+	@docker-compose -f docker-compose.production.yml restart
+
+update: ## Atualizar imagem e reiniciar
+	@echo "🔄 Atualizando..."
+	@docker-compose -f docker-compose.production.yml pull
+	@docker-compose -f docker-compose.production.yml up -d
+
+clean: ## Limpar containers e volumes não utilizados
+	@echo "🧹 Limpando..."
+	@docker system prune -f
+	@docker volume prune -f
+
+clean-all: ## Limpar TUDO (CUIDADO!)
+	@echo "⚠️  CUIDADO: Isso removerá TODOS os dados!"
+	@read -p "Digite 'CONFIRMAR' para continuar: " confirm && [ "$$confirm" = "CONFIRMAR" ]
+	@docker-compose -f docker-compose.production.yml down -v
+	@docker system prune -af
+	@docker volume prune -f
+
+health: ## Verificar saúde dos serviços
+	@echo "🔍 Verificando serviços..."
+	@docker-compose -f docker-compose.production.yml ps
+	@echo ""
+	@echo "🌍 Testando URL..."
+	@curl -f https://$(DOMAIN)/health && echo "✅ OK" || echo "❌ Falhou"
+
+ssl-check: ## Verificar certificado SSL
+	@echo "🔒 Verificando SSL para $(DOMAIN)..."
+	@echo | openssl s_client -connect $(DOMAIN):443 -servername $(DOMAIN) 2>/dev/null | openssl x509 -noout -dates
+
+deploy-info: ## Informações do deploy
+	@echo "📋 INFORMAÇÕES DO DEPLOY"
+	@echo "========================"
+	@echo "🌍 URL: https://$(DOMAIN)"
+	@echo "📊 Traefik: http://traefik.$(DOMAIN):8080"
+	@echo "🐳 Imagem: $(IMAGE_NAME)"
+	@echo "🗄️ Banco: $(POSTGRES_DB)"
+	@echo ""
+	@echo "📚 COMANDOS ÚTEIS:"
+	@echo "make logs          - Ver logs"
+	@echo "make shell         - Shell no app"
+	@echo "make db-migrate    - Executar migrations"
+	@echo "make backup        - Backup do banco"

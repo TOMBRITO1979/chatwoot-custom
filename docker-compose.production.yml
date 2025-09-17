@@ -1,0 +1,223 @@
+version: '3.8'
+
+# Rede pública para integração com outros serviços
+networks:
+  public:
+    external: true
+  chatwoot-internal:
+    driver: bridge
+
+# Volumes persistentes
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  traefik_data:
+    driver: local
+
+services:
+  # Traefik - Reverse Proxy com SSL automático
+  traefik:
+    image: traefik:v3.0
+    container_name: chatwoot-traefik
+    restart: unless-stopped
+    networks:
+      - public
+      - chatwoot-internal
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Dashboard (opcional, remover em produção)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_data:/letsencrypt
+    command:
+      # Global config
+      - --api.dashboard=true
+      - --api.insecure=true  # Remover em produção
+      - --log.level=INFO
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=public
+
+      # Entrypoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+
+      # SSL/TLS
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+
+      # Redirect HTTP to HTTPS
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+
+  # PostgreSQL com pgvector
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: chatwoot-postgres
+    restart: unless-stopped
+    networks:
+      - chatwoot-internal
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-chatwoot}
+      - POSTGRES_USER=${POSTGRES_USER:-chatwoot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_HOST_AUTH_METHOD=md5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatwoot}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    labels:
+      - "traefik.enable=false"
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: chatwoot-redis
+    restart: unless-stopped
+    networks:
+      - chatwoot-internal
+    volumes:
+      - redis_data:/data
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    labels:
+      - "traefik.enable=false"
+
+  # Chatwoot App
+  chatwoot:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    image: ${DOCKER_USERNAME}/chatwoot:latest
+    container_name: chatwoot-app
+    restart: unless-stopped
+    networks:
+      - public
+      - chatwoot-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Basic Rails config
+      - RAILS_ENV=production
+      - SECRET_KEY_BASE=${SECRET_KEY_BASE}
+      - FRONTEND_URL=https://${DOMAIN}
+
+      # Database
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DATABASE=${POSTGRES_DB:-chatwoot}
+      - POSTGRES_USERNAME=${POSTGRES_USER:-chatwoot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+
+      # Redis
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+
+      # Email (configurar conforme seu provedor)
+      - MAILER_SENDER_EMAIL=${MAILER_SENDER_EMAIL}
+      - SMTP_ADDRESS=${SMTP_ADDRESS}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_EMAIL=${SMTP_EMAIL}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_ENABLE_STARTTLS_AUTO=true
+      - SMTP_AUTHENTICATION=plain
+
+      # Storage (configurar S3 ou local)
+      - ACTIVE_STORAGE_SERVICE=${ACTIVE_STORAGE_SERVICE:-local}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_BUCKET=${AWS_BUCKET}
+
+      # Features opcionais
+      - ENABLE_ACCOUNT_SIGNUP=${ENABLE_ACCOUNT_SIGNUP:-false}
+      - USE_INBOX_AVATAR_FOR_BOT=true
+      - INSTALLATION_NAME=${INSTALLATION_NAME:-Chatwoot}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    labels:
+      # Traefik config
+      - "traefik.enable=true"
+      - "traefik.docker.network=public"
+
+      # HTTP Router
+      - "traefik.http.routers.chatwoot.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.chatwoot.entrypoints=websecure"
+      - "traefik.http.routers.chatwoot.tls.certresolver=letsencrypt"
+
+      # Service
+      - "traefik.http.services.chatwoot.loadbalancer.server.port=3000"
+
+      # Middleware para headers de segurança
+      - "traefik.http.middlewares.chatwoot-headers.headers.forceSTSHeader=true"
+      - "traefik.http.middlewares.chatwoot-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.chatwoot-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.chatwoot-headers.headers.stsPreload=true"
+      - "traefik.http.routers.chatwoot.middlewares=chatwoot-headers"
+
+  # Sidekiq Worker
+  sidekiq:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    image: ${DOCKER_USERNAME}/chatwoot:latest
+    container_name: chatwoot-sidekiq
+    restart: unless-stopped
+    networks:
+      - chatwoot-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Mesmas variáveis do app principal
+      - RAILS_ENV=production
+      - SECRET_KEY_BASE=${SECRET_KEY_BASE}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DATABASE=${POSTGRES_DB:-chatwoot}
+      - POSTGRES_USERNAME=${POSTGRES_USER:-chatwoot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - MAILER_SENDER_EMAIL=${MAILER_SENDER_EMAIL}
+      - SMTP_ADDRESS=${SMTP_ADDRESS}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_EMAIL=${SMTP_EMAIL}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - ACTIVE_STORAGE_SERVICE=${ACTIVE_STORAGE_SERVICE:-local}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_BUCKET=${AWS_BUCKET}
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    healthcheck:
+      test: ["CMD", "ps", "aux", "|", "grep", "[s]idekiq"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    labels:
+      - "traefik.enable=false"
